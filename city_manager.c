@@ -53,6 +53,10 @@ void cmd_filter(const char *district, int argc, char **conditions, const char *r
 int parse_condition(const char *input, char *field, char *op, char *value);
 int match_condition(Report *r, const char *field, const char *op, const char *value);
 
+/* Phase 2 */
+void notify_monitor(const char *district, const char *role, const char *user, int report_id);
+void cmd_remove_district(const char *district, const char *role, const char *user);
+
 //PERMISSION HELPERS
 
 /* Convert mode_t bits to a 9-char rwxrwxrwx string (written by student) */
@@ -282,6 +286,10 @@ void cmd_add(const char *district, const char *role, const char *user) {
 
   /* Refresh symlink */
   create_symlink(district);
+}
+
+/* Notificam monitorul via SIGUSR1 */
+notify_monitor(district, role, user, r.id);
 }
 
 /* ─────────────────────────────────────────────
@@ -638,6 +646,150 @@ int match_condition(Report *r, const char *field, const char *op, const char *va
 }
 
 /* ─────────────────────────────────────────────
+   notify_monitor - trimite SIGUSR1 către monitor
+   ───────────────────────────────────────────── */
+
+void notify_monitor(const char *district, const char *role, const char *user, int report_id) {
+  /* Citim PID-ul din .monitor_pid */
+  int fd = open(".monitor_pid", O_RDONLY);
+  if (fd < 0) {
+    /* Fisierul nu exista - monitorul nu ruleaza */
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "%s/logged_district", district);
+    if (strcmp(role, "manager") == 0) {
+      int lfd = open(log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+      if (lfd >= 0) {
+	time_t now = time(NULL);
+	char ts[64];
+	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+	char entry[512];
+	int len = snprintf(entry, sizeof(entry),
+			   "[%s] role=%s user=%s action=notify_monitor report #%d: monitor could not be informed (no .monitor_pid)\n",
+			   ts, role, user, report_id);
+	write(lfd, entry, len);
+	close(lfd);
+      }
+    }
+    fprintf(stderr, "WARNING: monitor not running (.monitor_pid not found). Could not notify.\n");
+    return;
+  }
+  char buf[32];
+  int n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    fprintf(stderr, "WARNING: .monitor_pid is empty. Could not notify monitor.\n");
+    return;
+  }
+  buf[n] = '\0';
+  pid_t monitor_pid = (pid_t)atoi(buf);
+  if (monitor_pid <= 0) {
+    fprintf(stderr, "WARNING: invalid PID in .monitor_pid. Could not notify monitor.\n");
+    return;
+  }
+
+  /* Trimitem SIGUSR1 */
+  if (kill(monitor_pid, SIGUSR1) < 0) {
+    fprintf(stderr, "WARNING: could not send SIGUSR1 to monitor (PID %d): %s\n",
+	    monitor_pid, strerror(errno));
+    /* Scriem in log ca notificarea a esuat */
+    if (strcmp(role, "manager") == 0) {
+      char log_path[256];
+      snprintf(log_path, sizeof(log_path), "%s/logged_district", district);
+      int lfd = open(log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+      if (lfd >= 0) {
+	time_t now = time(NULL);
+	char ts[64];
+	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+	char entry[512];
+	int len = snprintf(entry, sizeof(entry),
+			   "[%s] role=%s user=%s action=notify_monitor report #%d: signal failed (PID %d: %s)\n",
+			   ts, role, user, report_id, monitor_pid, strerror(errno));
+	write(lfd, entry, len);
+	close(lfd);
+      }
+    }
+    return;
+  } 
+  printf("Monitor (PID %d) notified of new report #%d.\n", monitor_pid, report_id);
+
+  /* Scriem in log ca notificarea a reusit */
+  if (strcmp(role, "manager") == 0) {
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "%s/logged_district", district);
+    int lfd = open(log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (lfd >= 0) {
+      time_t now = time(NULL);
+      char ts[64];
+      strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+      char entry[512];
+      int len = snprintf(entry, sizeof(entry),
+			 "[%s] role=%s user=%s action=notify_monitor report #%d: monitor (PID %d) notified successfully\n",
+			 ts, role, user, report_id, monitor_pid);
+      write(lfd, entry, len);
+      close(lfd);
+    }
+  }
+}
+
+
+/* ─────────────────────────────────────────────
+   cmd_remove_district (manager only)
+   ───────────────────────────────────────────── */
+
+void cmd_remove_district(const char *district, const char *role, const char *user) {
+  (void)user;
+  if (strcmp(role, "manager") != 0) {
+    fprintf(stderr, "ERROR: only managers can remove districts.\n");
+    exit(1);
+  }
+
+  /* Verificam ca districtul exista */
+  struct stat st;
+  if (stat(district, &st) < 0) {
+    fprintf(stderr, "ERROR: district '%s' does not exist.\n", district);
+    exit(1);
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "ERROR: '%s' is not a directory.\n", district);
+    exit(1);
+  }
+  /* Stergem symlink-ul inainte de director */
+  remove_symlink(district);
+
+  /* fork() + exec() pentru rm -rf */
+  pid_t pid = fork();
+  if (pid < 0) {
+    fprintf(stderr, "ERROR: fork failed: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (pid == 0) {
+    /* Proces copil: executam rm -rf */
+    /* Construim argumentele explicit - fara shell, fara riscuri */
+    char district_copy[256];
+    strncpy(district_copy, district, sizeof(district_copy) - 1);
+    district_copy[sizeof(district_copy) - 1] = '\0';
+
+    execlp("rm", "rm", "-rf", district_copy, (char *)NULL);
+    /* Daca ajungem aici, exec a esuat */
+    fprintf(stderr, "ERROR: exec rm failed: %s\n", strerror(errno));
+    exit(1);
+  }  
+  /* Proces parinte: asteptam copilul */
+  int status;
+  waitpid(pid, &status, 0);
+
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    printf("District '%s' removed successfully.\n", district);
+    /* Log actiunea */
+    /* Nu mai putem scrie in logged_district (a fost sters) - afisam doar mesaj */
+  } else {
+    fprintf(stderr, "ERROR: rm -rf failed for district '%s'.\n", district);
+    exit(1);
+  }
+}
+
+/* ─────────────────────────────────────────────
    cmd_filter
    ───────────────────────────────────────────── */
 
@@ -775,7 +927,12 @@ int main(int argc, char *argv[])
     if (cmd_argc < 2) { fprintf(stderr, "ERROR: --filter requires \n"); return 1; }
     cmd_filter(cmd_args[0], cmd_argc - 1, &cmd_args[1], role, user);
 
-  } else {
+  }
+  else if (strcmp(command, "remove_district") == 0) {
+    if (cmd_argc < 1) { fprintf(stderr, "ERROR: --remove_district requires \n"); return 1; }
+    cmd_remove_district(cmd_args[0], role, user);
+
+  }else {
     fprintf(stderr, "ERROR: unknown command '--%s'\n", command);
     return 1;
   }
