@@ -7,6 +7,8 @@
 #include<errno.h>
 #include<sys/stat.h>
 #include<sys/types.h>
+#include<signal.h>
+#include<sys/wait.h>
 
 #define MAX_NAME 64
 #define MAX_CAT 32
@@ -286,7 +288,7 @@ void cmd_add(const char *district, const char *role, const char *user) {
 
   /* Refresh symlink */
   create_symlink(district);
-}
+
 
 /* Notificam monitorul via SIGUSR1 */
 notify_monitor(district, role, user, r.id);
